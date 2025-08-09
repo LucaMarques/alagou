@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Alagou? — Protótipo</title>
+  <link rel="stylesheet" href="/style.css"/>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="icon" href="/favicon.ico" type="image/x-icon">
+</head>
+
+<body>
+  <div id="map"></div>
+
+  <div class="toolbar" aria-hidden="false">
+    <button id="btnStart" class="primary">📍 Definir Partida</button>
+    <button id="btnEnd" class="primary">🏁 Definir Destino</button>
+    <select id="lvlSelect" title="Nível do alagamento">
+      <option value="leve">Leve (25m)</option>
+      <option value="medio" selected>Médio (50m)</option>
+      <option value="grave">Grave (75m)</option>
+    </select>
+    <button id="btnDenunciar">🚨 Denunciar Alagamento</button>
+    <button id="btnClear">♻️ Limpar</button>
+    <span class="note" id="statusNote">Status: aguardando ação</span>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+  /* --- Configurações --- */
+  const API_KEY = "Chave-Aqui"; // <-- substitua aqui com sua chave ORS
+  const INITIAL_CENTER = [-7.11532, -34.86100];
+  const MAP_ZOOM = 13;
+
+  /* --- Inicializa mapa --- */
+  const map = L.map('map').setView(INITIAL_CENTER, MAP_ZOOM);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution:'© OpenStreetMap contributors' }).addTo(map);
+
+  /* --- Estado --- */
+  let startPoint = null, endPoint = null;
+  let startMarker = null, endMarker = null;
+  let routeLayer = null;
+  const alagamentos = []; // { center: L.LatLng, radius: meters, circleLayer: L.Circle, polygonCoords: [[lng,lat],...] }
+
+  /* --- Helpers utilitários --- */
+  function ajustarCoordenada(latlng) {
+    // evita sobreposição exata
+    const offsetLat = (Math.random() - 0.5) * 0.00002;
+    const offsetLng = (Math.random() - 0.5) * 0.00002;
+    return L.latLng(latlng.lat + offsetLat, latlng.lng + offsetLng);
+  }
+
+  function gerarPoligonoCircular(centerLatLng, radiusMeters = 100, steps = 48) {
+    // Retorna um array de [lng, lat] formando um anel fechado (último ponto = primeiro)
+    const coords = [];
+    const latRad = centerLatLng.lat * Math.PI / 180;
+    const lonRad = centerLatLng.lng * Math.PI / 180;
+    const angularDist = radiusMeters / 6378137; // raio médio da Terra
+    for (let i = 0; i <= steps; i++) {
+      const theta = (i / steps) * (2 * Math.PI);
+      const lat2 = Math.asin( Math.sin(latRad) * Math.cos(angularDist) +
+        Math.cos(latRad) * Math.sin(angularDist) * Math.cos(theta) );
+      const lon2 = lonRad + Math.atan2(Math.sin(theta) * Math.sin(angularDist) * Math.cos(latRad),
+        Math.cos(angularDist) - Math.sin(latRad) * Math.sin(lat2));
+      coords.push([lon2 * 180 / Math.PI, lat2 * 180 / Math.PI]);
+    }
+    // garante fechamento
+    if (coords.length && (coords[0][0] !== coords[coords.length-1][0] || coords[0][1] !== coords[coords.length-1][1])) {
+      coords.push(coords[0]);
+    }
+    return coords;
+  }
+
+  function pointInPolygon(pointLngLat, polygonRing) {
+    // pointLngLat = [lng, lat], polygonRing = array of [lng, lat] (closed)
+    const x = pointLngLat[0], y = pointLngLat[1];
+    let inside = false;
+    for (let i = 0, j = polygonRing.length - 1; i < polygonRing.length; j = i++) {
+      const xi = polygonRing[i][0], yi = polygonRing[i][1];
+      const xj = polygonRing[j][0], yj = polygonRing[j][1];
+      const intersect = ((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi + 0.0) + xi);
+      if (intersect) inside = !inside;
+    }
+    return inside;
+  }
+
+  /* --- UI helpers --- */
+  const statusNote = document.getElementById('statusNote');
+  function setStatus(txt) { statusNote.textContent = 'Status: ' + txt; }
+
+  /* --- Marcação: partida, destino e alagamento --- */
+  document.getElementById('btnStart').addEventListener('click', () => {
+    setStatus('Clique no mapa para definir partida');
+    map.getContainer().classList.add('crosshair-cursor');
+    map.once('click', (e) => {
+      map.getContainer().classList.remove('crosshair-cursor');
+      const p = ajustarCoordenada(e.latlng);
+      if (startMarker) map.removeLayer(startMarker);
+      startPoint = p;
+      startMarker = L.marker(p, {title:'Partida'}).addTo(map).bindPopup('Partida').openPopup();
+      setStatus('Partida definida');
+      // tenta calcular se já houver destino
+      if (endPoint) calcularRota();
+    });
+  });
+
+  document.getElementById('btnEnd').addEventListener('click', () => {
+    setStatus('Clique no mapa para definir destino');
+    map.getContainer().classList.add('crosshair-cursor');
+    map.once('click', (e) => {
+      map.getContainer().classList.remove('crosshair-cursor');
+      const p = ajustarCoordenada(e.latlng);
+      if (endMarker) map.removeLayer(endMarker);
+      endPoint = p;
+      endMarker = L.marker(p, {title:'Destino'}).addTo(map).bindPopup('Destino').openPopup();
+      setStatus('Destino definido');
+      if (startPoint) calcularRota();
+    });
+  });
+
+  document.getElementById('btnDenunciar').addEventListener('click', () => {
+    const nivel = document.getElementById('lvlSelect').value; // leve/medio/grave
+    setStatus('Clique no mapa para marcar alagamento (' + nivel + ')');
+    map.getContainer().classList.add('crosshair-cursor');
+    map.once('click', (e) => {
+      map.getContainer().classList.remove('crosshair-cursor');
+      const p = ajustarCoordenada(e.latlng);
+      let raio = 100, color = 'rgba(0,123,255,0.35)';
+      if (nivel === 'leve') { raio = 25; color = 'rgba(0,180,200,0.28)'; }
+      if (nivel === 'medio') { raio = 50; color = 'rgba(255,193,7,0.28)'; }
+      if (nivel === 'grave') { raio = 75; color = 'rgba(220,53,69,0.28)'; }
+
+      // desenha esfera semi-transparente
+      const c = L.circle(p, { radius: raio, color: color, fillColor: color, fillOpacity: 0.6, weight:1 }).addTo(map);
+      // guarda dados
+      alagamentos.push({ center: p, radius: raio, circleLayer: c });
+      setStatus('Alagamento marcado (' + nivel + ')');
+      // se ambos pontos já definidos, recalcula rota automaticamente
+      if (startPoint && endPoint) calcularRota();
+    });
+  });
+
+  /* limpar tudo */
+  document.getElementById('btnClear').addEventListener('click', () => {
+    if (startMarker) { map.removeLayer(startMarker); startMarker = null; startPoint = null; }
+    if (endMarker) { map.removeLayer(endMarker); endMarker = null; endPoint = null; }
+    if (routeLayer) { map.removeLayer(routeLayer); routeLayer = null; }
+    alagamentos.forEach(a => map.removeLayer(a.circleLayer));
+    alagamentos.length = 0;
+    setStatus('Limpo');
+  });
+
+  /* --- Roteamento (ORS com avoid_polygons) --- */
+  function prepararMultiPolygonAvoid() {
+    // Retorna array para options.avoid_polygons.coordinates (MultiPolygon)
+    const multi = [];
+    for (const a of alagamentos) {
+      const ring = gerarPoligonoCircular(a.center, a.radius, 48); // ring is array [ [lng,lat], ... ] and closed
+      // garantir fechamento
+      if (ring.length && (ring[0][0] !== ring[ring.length-1][0] || ring[0][1] !== ring[ring.length-1][1])) {
+        ring.push(ring[0]);
+      }
+      multi.push([ ring ]);
+    }
+    return multi;
+  }
+
+  function pontoDentroDeAlgumAlagamento(pointLatLng) {
+    const pt = [pointLatLng.lng, pointLatLng.lat];
+    for (const a of alagamentos) {
+      const ring = gerarPoligonoCircular(a.center, a.radius, 48);
+      if (pointInPolygon(pt, ring)) return true;
+    }
+    return false;
+  }
+
+  async function calcularRota() {
+    if (!startPoint || !endPoint) {
+      setStatus('Defina partida e destino antes de calcular rota');
+      return;
+    }
+
+    // verifica se start/end estão dentro de alguma área de alagamento
+    if (pontoDentroDeAlgumAlagamento(startPoint)) {
+      alert('Ponto de partida está dentro de área alagada. Mova a partida para fora do polígono ou remova o alagamento.');
+      setStatus('Partida dentro de alagamento — mover');
+      return;
+    }
+    if (pontoDentroDeAlgumAlagamento(endPoint)) {
+      alert('Ponto de destino está dentro de área alagada. Mova o destino para fora do polígono ou remova o alagamento.');
+      setStatus('Destino dentro de alagamento — mover');
+      return;
+    }
+
+    // Remove rota antiga
+    if (routeLayer) { map.removeLayer(routeLayer); routeLayer = null; }
+
+    // Se não há alagamentos, usa rota direta sem avoid_polygons
+    const body = {
+      coordinates: [
+        [ startPoint.lng, startPoint.lat ],
+        [ endPoint.lng, endPoint.lat ]
+      ],
+      format: 'geojson'
+    };
+
+    if (alagamentos.length > 0) {
+      const mp = prepararMultiPolygonAvoid(); 
+      body.options = { avoid_polygons: { type: 'MultiPolygon', coordinates: mp } };
+    }
+
+    // Log para debug
+    console.log('ORS request body:', body);
+
+    // Caso não tenha chave
+    if (!API_KEY || API_KEY.trim().length === 0) {
+      console.warn('API_KEY ausente — usando rota simulada');
+      setStatus('API_ORs ausente — simulada');
+      desenharRotaSimulada();
+      return;
+    }
+
+    setStatus('Calculando rota (ORS)...');
+
+    try {
+      const res = await fetch('https://api.openrouteservice.org/v2/directions/driving-car/geojson', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': API_KEY },
+        body: JSON.stringify(body),
+      });
+
+      const raw = await res.text();
+      console.log('ORS raw response status:', res.status, 'body:', raw.slice(0,4000));
+
+      if (!res.ok) {
+        // Informações mais amigáveis para alguns erros comuns
+        if (res.status === 401 || res.status === 403) {
+          alert('Chave ORS inválida ou sem permissão (status ' + res.status + '). Substitua a chave.');
+          setStatus('Chave ORS inválida');
+        } else if (res.status === 406) {
+          alert('Requisição rejeitada pelo ORS (406). Verifique os polígonos de avoid. A rota usará fallback.');
+          setStatus('ORS retornou 406 — fallback');
+        } else {
+          setStatus('ORS erro ' + res.status + ' — fallback');
+        }
+        desenharRotaSimulada();
+        return;
+      }
+
+      const data = JSON.parse(raw);
+  
+      if (!data || !data.features || !data.features[0] || !data.features[0].geometry) {
+        console.warn('Resposta ORS sem geometria válida', data);
+        setStatus('ORS sem geometria — fallback');
+        desenharRotaSimulada();
+        return;
+      }
+      // desenha rota real
+      routeLayer = L.geoJSON(data, { style: { color: '#1976d2', weight: 4 } }).addTo(map);
+      map.fitBounds(routeLayer.getBounds(), {padding:[20,20]});
+      setStatus('Rota real traçada');
+    } catch (err) {
+      console.error('Erro ao chamar ORS:', err);
+      setStatus('Erro de rede / exceção — fallback');
+      desenharRotaSimulada();
+    }
+  }
+
+  function desenharRotaSimulada() {
+    if (!startPoint || !endPoint) return;
+    if (routeLayer) { map.removeLayer(routeLayer); routeLayer = null; }
+    const sim = [
+      [ startPoint.lat, startPoint.lng ],
+      [ (startPoint.lat + endPoint.lat)/2 + 0.003, (startPoint.lng + endPoint.lng)/2 - 0.002 ],
+      [ endPoint.lat, endPoint.lng ]
+    ];
+    routeLayer = L.polyline(sim, { color: '#ff9800', weight: 4, dashArray: '8 6' }).addTo(map);
+    map.fitBounds(routeLayer.getBounds(), {padding:[20,20]});
+    setStatus('Rota simulada desenhada');
+  }
+
+  /* --- util: pointInPolygon (em lon/lat) --- */
+  function pointInPolygon(pt, polygon) {
+    let x = pt[0], y = pt[1];
+    let inside = false;
+    for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+      const xi = polygon[i][0], yi = polygon[i][1];
+      const xj = polygon[j][0], yj = polygon[j][1];
+      const intersect = ((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi + 0.0) + xi);
+      if (intersect) inside = !inside;
+    }
+    return inside;
+  }
+
+  setStatus('Pronto — defina partida/destino ou denuncie alagamentos');
+  </script>
+
+</body>
+</html>
